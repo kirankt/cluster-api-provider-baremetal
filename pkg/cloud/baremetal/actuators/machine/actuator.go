@@ -18,9 +18,17 @@ package machine
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	goerrors "errors"
 	"fmt"
+	retryablehttp "github.com/hashicorp/go-retryablehttp"
+	"io/ioutil"
 	"log"
 	"math/rand"
+	"net/http"
 	"strings"
 	"time"
 
@@ -38,6 +46,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 )
@@ -421,6 +430,146 @@ func consumerRefMatches(consumer *corev1.ObjectReference, machine *machinev1.Mac
 	return true
 }
 
+// updateUserData fetches full ignition from MCS and updates the UserData secret reference
+func (a *Actuator) updateUserData(ctx context.Context, config *bmv1alpha1.BareMetalMachineProviderSpec,
+	machine *machinev1.Machine) error {
+
+	// Try to fetch the full ignition secret to see if it exists
+	machineUserDataSecret := &corev1.Secret{}
+	key := client.ObjectKey{
+		Name:      machine.Name + "-user-data",
+		Namespace: machine.Namespace,
+	}
+	// Secret already exists. Set secretReference and return
+	err := a.client.Get(ctx, key, machineUserDataSecret)
+	if err == nil {
+		// Set Machine's secretreference
+		config.UserData = &corev1.SecretReference{
+			Name:      machine.Name + "-user-data",
+			Namespace: machine.Namespace,
+		}
+		return nil
+	}
+
+	// userDataSecret is the pointer ignition originally
+	// created by openshift installer. Fetch it to extract
+	// its content (an URL containg full ignition and a
+	// CA cert for the URL's https connection
+	userDataSecret := corev1.Secret{}
+	key = client.ObjectKey{
+		Name:      config.UserData.Name,
+		Namespace: config.UserData.Namespace,
+	}
+	err = a.client.Get(ctx, key, &userDataSecret)
+	if err != nil {
+		log.Printf("Cannot get %s secret: %s", config.UserData.Name, err.Error())
+		return err
+	}
+	encodedUserDataBytes := userDataSecret.Data["userData"]
+	var userData []byte
+	userData, err = base64.StdEncoding.DecodeString(string(encodedUserDataBytes))
+	if err != nil {
+		log.Printf("Error encoding userData into B64 : %s", err.Error())
+		return err
+	}
+
+	var ignConf map[string]interface{}
+	if err := json.Unmarshal(userData, &ignConf); err != nil {
+		log.Printf(string(userData))
+		log.Printf("Cannot unmarshal ignition config from userData : %s", err.Error())
+		return err
+	}
+
+	ignitionURL := ignConf["ignition"].(map[string]interface{})["config"].(map[string]interface{})["append"].([]interface{})[0].(map[string]interface{})["source"].(string)
+	caCertRaw := ignConf["ignition"].(map[string]interface{})["security"].(map[string]interface{})["tls"].(map[string]interface{})["certificateAuthorities"].([]interface{})[0].(map[string]interface{})["source"].(string)
+	caCertB64 := strings.TrimPrefix(caCertRaw, "data:text/plain;charset=utf-8;base64,")
+
+	// We didn't get any URL
+	if ignitionURL == "" {
+		err := goerrors.New("Error extracting fullIgnition URL")
+		log.Printf("Error extracting fullIgnition URL : %s", err.Error())
+		return err
+	}
+
+	// Setup https transport
+	transport := &http.Transport{}
+	if caCertB64 == "" {
+		// Skip TLS verify
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	} else {
+		caCert, err := base64.StdEncoding.DecodeString(caCertB64)
+		if err != nil {
+			log.Printf("Could not decode caCert: %s", err.Error())
+			return err
+		}
+		caCertPool := x509.NewCertPool()
+		caCertPool.AppendCertsFromPEM(caCert)
+		transport.TLSClientConfig = &tls.Config{RootCAs: caCertPool}
+	}
+	client := retryablehttp.NewClient()
+	client.HTTPClient.Transport = transport
+
+	// Get the full ignition from the URL
+	resp, err := client.Get(ignitionURL)
+	if err != nil {
+		log.Printf("Error fetching ignition from URL : %s", err.Error())
+		return err
+	}
+	defer resp.Body.Close()
+
+	var fullIgnition []byte
+	fullIgnition, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading ignition data from URL : %s", err.Error())
+		return err
+	}
+
+	// Create a new secret with ignition data
+	machineUserDataSecret = createNewMachineSecret(fullIgnition, machine)
+	err = a.client.Create(ctx, machineUserDataSecret)
+	if err != nil {
+		log.Printf("Cannot create the %s secret: %s", machine.Name+"-user-data", err.Error())
+		return err
+	}
+
+	// Set Machine's secretreference to the newly created secret
+	config.UserData = &corev1.SecretReference{
+		Name:      machine.Name + "-user-data",
+		Namespace: machine.Namespace,
+	}
+
+	return nil
+}
+
+// createNewSecret uses Full Ignition data and creates a '-user-data' suffixed secret per machine
+func createNewMachineSecret(data []byte, machine *machinev1.Machine) *corev1.Secret {
+	// Create a new Secret with Full Ignition
+	return &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Secret",
+			APIVersion: "v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      machine.Name + "-user-data",
+			Namespace: machine.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				metav1.OwnerReference{
+					Controller: pointer.BoolPtr(true),
+					Kind:       "Machine",
+					Name:       machine.Name,
+					APIVersion: machine.APIVersion,
+					UID:        machine.UID,
+				},
+			},
+			Finalizers: []string{machinev1.MachineFinalizer},
+		},
+		Data: map[string][]byte{
+			"userData": []byte(base64.URLEncoding.EncodeToString(data)),
+		},
+		Type: "Opaque",
+	}
+}
+
 // setHostSpec will ensure the host's Spec is set according to the machine's
 // details. It will then update the host via the kube API. If UserData does not
 // include a Namespace, it will default to the Machine's namespace.
@@ -437,6 +586,11 @@ func (a *Actuator) setHostSpec(ctx context.Context, host *bmh.BareMetalHost, mac
 		host.Spec.Image = &bmh.Image{
 			URL:      config.Image.URL,
 			Checksum: config.Image.Checksum,
+		}
+		// Fetch full ignition and update the UserData secret
+		err := a.updateUserData(ctx, config, machine)
+		if err != nil {
+			log.Printf("Could not update userData secret reference: %s", err)
 		}
 		host.Spec.UserData = config.UserData
 		if host.Spec.UserData != nil && host.Spec.UserData.Namespace == "" {

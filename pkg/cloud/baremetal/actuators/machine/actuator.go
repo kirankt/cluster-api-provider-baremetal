@@ -676,7 +676,7 @@ func (a *Actuator) updateUserData(ctx context.Context, bmconfig *bmv1alpha1.Bare
 	}
 	err = a.client.Get(ctx, key, &kubeconfigSecret)
 	if err != nil {
-		return fmt.Errorf("cannot get %s secret: %w", kubeconfigKubeletSecret, err)
+		return fmt.Errorf("cannot get %s secret: %w", workerKubeconfigUserData, err)
 	}
 	kubeconfigBytes := kubeconfigSecret.Data["kubeconfig"]
 	if len(kubeconfigBytes) == 0 {

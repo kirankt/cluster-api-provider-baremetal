@@ -29,6 +29,8 @@ import (
 	"github.com/openshift/cluster-api-provider-baremetal/pkg/manager/wrapper"
 	machinev1beta1 "github.com/openshift/machine-api-operator/pkg/apis/machine/v1beta1"
 	maomachine "github.com/openshift/machine-api-operator/pkg/controller/machine"
+	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
+
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/rest"
@@ -142,6 +144,10 @@ func main() {
 	}
 
 	if err := bmoapis.AddToScheme(mgr.GetScheme()); err != nil {
+		panic(err)
+	}
+
+	if err := mcfgv1.AddToScheme(mgr.GetScheme()); err != nil {
 		panic(err)
 	}
 

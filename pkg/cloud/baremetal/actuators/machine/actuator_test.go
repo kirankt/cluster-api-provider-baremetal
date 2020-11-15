@@ -2,18 +2,12 @@ package machine
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
-	"reflect"
-
-	bmoapis "github.com/metal3-io/baremetal-operator/pkg/apis"
-	bmh "github.com/metal3-io/baremetal-operator/pkg/apis/metal3/v1alpha1"
-	"github.com/metal3-io/baremetal-operator/pkg/utils"
-	bmv1alpha1 "github.com/openshift/cluster-api-provider-baremetal/pkg/apis/baremetal/v1alpha1"
-	machinev1beta1 "github.com/openshift/machine-api-operator/pkg/apis/machine/v1beta1"
-	machineapierrors "github.com/openshift/machine-api-operator/pkg/controller/machine"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -25,12 +19,23 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/yaml"
+
+	bmoapis "github.com/metal3-io/baremetal-operator/pkg/apis"
+	bmh "github.com/metal3-io/baremetal-operator/pkg/apis/metal3/v1alpha1"
+	"github.com/metal3-io/baremetal-operator/pkg/utils"
+	bmv1alpha1 "github.com/openshift/cluster-api-provider-baremetal/pkg/apis/baremetal/v1alpha1"
+	machinev1beta1 "github.com/openshift/machine-api-operator/pkg/apis/machine/v1beta1"
+	machineapierrors "github.com/openshift/machine-api-operator/pkg/controller/machine"
+	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
+	ctrlcommon "github.com/openshift/machine-config-operator/pkg/controller/common"
+	"github.com/openshift/machine-config-operator/test/helpers"
 )
 
 const (
 	testImageURL                = "http://172.22.0.1/images/rhcos-ootpa-latest.qcow2"
 	testImageChecksumURL        = "http://172.22.0.1/images/rhcos-ootpa-latest.qcow2.md5sum"
 	testUserDataSecretName      = "worker-user-data"
+	testUpdatedDataSecretName   = "machine1-user-data"
 	testUserDataSecretNamespace = "myns"
 	testRemediationNamespace    = "remediationNs"
 )
@@ -451,17 +456,15 @@ func TestChooseHost(t *testing.T) {
 
 func TestProvisionHost(t *testing.T) {
 	for _, tc := range []struct {
-		Scenario                  string
-		UserDataNamespace         string
-		ExpectedUserDataNamespace string
-		Host                      bmh.BareMetalHost
-		ExpectedImage             *bmh.Image
-		ExpectUserData            bool
+		Scenario          string
+		MachineConfig     *mcfgv1.MachineConfig
+		MachineConfigPool *mcfgv1.MachineConfigPool
+		Host              bmh.BareMetalHost
+		ExpectedImage     *bmh.Image
+		ExpectUserData    bool
 	}{
 		{
-			Scenario:                  "user data has explicit alternate namespace",
-			UserDataNamespace:         "otherns",
-			ExpectedUserDataNamespace: "otherns",
+			Scenario: "rendered machine config fetched successfully and secret updated",
 			Host: bmh.BareMetalHost{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "host2",
@@ -474,11 +477,30 @@ func TestProvisionHost(t *testing.T) {
 			},
 			ExpectUserData: true,
 		},
-
 		{
-			Scenario:                  "user data has no namespace",
-			UserDataNamespace:         "",
-			ExpectedUserDataNamespace: "myns",
+			Scenario: "machineconfig pool cannot be determined from role",
+			MachineConfig: &mcfgv1.MachineConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "rendered-worker-1234567890",
+				},
+				Spec: mcfgv1.MachineConfigSpec{
+					Config: runtime.RawExtension{
+						Raw: helpers.MarshalOrDie(ctrlcommon.NewIgnConfig()),
+					},
+				},
+			},
+			MachineConfigPool: &mcfgv1.MachineConfigPool{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "notaworker",
+				},
+				Spec: mcfgv1.MachineConfigPoolSpec{
+					Configuration: mcfgv1.MachineConfigPoolStatusConfiguration{
+						ObjectReference: corev1.ObjectReference{
+							Name: "rendered-worker-1234567890",
+						},
+					},
+				},
+			},
 			Host: bmh.BareMetalHost{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "host2",
@@ -489,13 +511,10 @@ func TestProvisionHost(t *testing.T) {
 				URL:      testImageURL,
 				Checksum: testImageChecksumURL,
 			},
-			ExpectUserData: true,
+			ExpectUserData: false,
 		},
-
 		{
-			Scenario:                  "externally provisioned, same machine",
-			UserDataNamespace:         "",
-			ExpectedUserDataNamespace: "myns",
+			Scenario: "externally provisioned, same machine",
 			Host: bmh.BareMetalHost{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "host2",
@@ -516,11 +535,8 @@ func TestProvisionHost(t *testing.T) {
 			},
 			ExpectUserData: true,
 		},
-
 		{
-			Scenario:                  "previously provisioned, different image, unchanged",
-			UserDataNamespace:         "",
-			ExpectedUserDataNamespace: "myns",
+			Scenario: "previously provisioned, different image, unchanged",
 			Host: bmh.BareMetalHost{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "host2",
@@ -549,21 +565,73 @@ func TestProvisionHost(t *testing.T) {
 
 		t.Run(tc.Scenario, func(t *testing.T) {
 			// test data
-			config, providerSpec := newConfig(t, tc.UserDataNamespace, map[string]string{}, []bmv1alpha1.HostSelectorRequirement{})
+			config, providerSpec := newConfig(t, testUserDataSecretNamespace, map[string]string{}, []bmv1alpha1.HostSelectorRequirement{})
 			machine := machinev1beta1.Machine{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "machine1",
 					Namespace: "myns",
+					Labels:    map[string]string{machineRoleLabel: "worker"},
 				},
 				Spec: machinev1beta1.MachineSpec{
 					ProviderSpec: providerSpec,
 				},
 			}
 
+			mc := &mcfgv1.MachineConfig{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "rendered-worker-1234567890",
+				},
+				Spec: mcfgv1.MachineConfigSpec{
+					Config: runtime.RawExtension{
+						Raw: helpers.MarshalOrDie(ctrlcommon.NewIgnConfig()),
+					},
+				},
+			}
+			mcp := &mcfgv1.MachineConfigPool{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "worker",
+				},
+				Spec: mcfgv1.MachineConfigPoolSpec{
+					Configuration: mcfgv1.MachineConfigPoolStatusConfiguration{
+						ObjectReference: corev1.ObjectReference{
+							Name: "rendered-worker-1234567890",
+						},
+					},
+				},
+			}
+
+			data := make(map[string][]byte)
+			data["kubeconfig"] = []byte(base64.StdEncoding.EncodeToString([]byte("Hello Kubelet")))
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      kubeconfigKubeletSecret,
+					Namespace: testUserDataSecretNamespace,
+				},
+				Data: data,
+			}
+
 			// test setup
 			scheme := runtime.NewScheme()
 			bmoapis.AddToScheme(scheme)
-			c := fakeclient.NewFakeClientWithScheme(scheme, &tc.Host)
+			corev1.AddToScheme(scheme)
+			mcfgv1.AddToScheme(scheme)
+			c := fakeclient.NewFakeClientWithScheme(scheme)
+
+			// Create objects
+			if tc.MachineConfigPool != nil {
+				c.Create(context.TODO(), tc.MachineConfigPool)
+			} else {
+				c.Create(context.TODO(), mcp)
+			}
+			if tc.MachineConfig != nil {
+				c.Create(context.TODO(), tc.MachineConfig)
+			} else {
+				c.Create(context.TODO(), mc)
+			}
+			if &tc.Host != nil {
+				c.Create(context.TODO(), &tc.Host)
+			}
+			c.Create(context.TODO(), secret)
 
 			actuator, err := NewActuator(ActuatorParams{
 				Client: c,
@@ -575,7 +643,8 @@ func TestProvisionHost(t *testing.T) {
 
 			// run the function
 			err = actuator.provisionHost(context.TODO(), &tc.Host, &machine, config)
-			if err != nil {
+			if tc.ExpectUserData && err != nil {
+				fmt.Println(tc.ExpectUserData)
 				t.Errorf("%v", err)
 				return
 			}
@@ -589,43 +658,40 @@ func TestProvisionHost(t *testing.T) {
 			}
 
 			// validate the result
-			if savedHost.Spec.ConsumerRef == nil {
-				t.Errorf("ConsumerRef not set")
-				return
-			}
-			if savedHost.Spec.ConsumerRef.Name != machine.Name {
-				t.Errorf("found consumer ref %v", savedHost.Spec.ConsumerRef)
-			}
-			if savedHost.Spec.ConsumerRef.Namespace != machine.Namespace {
-				t.Errorf("found consumer ref %v", savedHost.Spec.ConsumerRef)
-			}
-			if savedHost.Spec.ConsumerRef.Kind != "Machine" {
-				t.Errorf("found consumer ref %v", savedHost.Spec.ConsumerRef)
-			}
-			if savedHost.Spec.Online != true {
-				t.Errorf("host not set to Online")
-			}
-			if tc.ExpectedImage == nil {
-				if savedHost.Spec.Image != nil {
-					t.Errorf("Expected image %v but got %v", tc.ExpectedImage, savedHost.Spec.Image)
-					return
-				}
-			} else {
-				if *(savedHost.Spec.Image) != *(tc.ExpectedImage) {
-					t.Errorf("Expected image %v but got %v", tc.ExpectedImage, savedHost.Spec.Image)
-					return
-				}
-			}
 			if tc.ExpectUserData {
+				if savedHost.Spec.ConsumerRef == nil {
+					t.Errorf("ConsumerRef not set")
+					return
+				}
+				if savedHost.Spec.ConsumerRef.Name != machine.Name {
+					t.Errorf("found consumer ref %v", savedHost.Spec.ConsumerRef)
+				}
+				if savedHost.Spec.ConsumerRef.Namespace != machine.Namespace {
+					t.Errorf("found consumer ref %v", savedHost.Spec.ConsumerRef)
+				}
+				if savedHost.Spec.ConsumerRef.Kind != "Machine" {
+					t.Errorf("found consumer ref %v", savedHost.Spec.ConsumerRef)
+				}
+				if savedHost.Spec.Online != true {
+					t.Errorf("host not set to Online")
+				}
+				if tc.ExpectedImage == nil {
+					if savedHost.Spec.Image != nil {
+						t.Errorf("Expected image %v but got %v", tc.ExpectedImage, savedHost.Spec.Image)
+						return
+					}
+				} else {
+					if *(savedHost.Spec.Image) != *(tc.ExpectedImage) {
+						t.Errorf("Expected image %v but got %v", tc.ExpectedImage, savedHost.Spec.Image)
+						return
+					}
+				}
 				if savedHost.Spec.UserData == nil {
 					t.Errorf("UserData not set")
 					return
 				}
-				if savedHost.Spec.UserData.Namespace != tc.ExpectedUserDataNamespace {
-					t.Errorf("expected Userdata.Namespace %s, got %s", tc.ExpectedUserDataNamespace, savedHost.Spec.UserData.Namespace)
-				}
-				if savedHost.Spec.UserData.Name != testUserDataSecretName {
-					t.Errorf("expected Userdata.Name %s, got %s", testUserDataSecretName, savedHost.Spec.UserData.Name)
+				if savedHost.Spec.UserData.Name != testUpdatedDataSecretName {
+					t.Errorf("expected Userdata.Name %s, got %s", testUpdatedDataSecretName, savedHost.Spec.UserData.Name)
 				}
 			} else {
 				if savedHost.Spec.UserData != nil {
